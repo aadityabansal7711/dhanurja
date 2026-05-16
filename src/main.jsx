@@ -1021,6 +1021,11 @@ function createApplicationRecord(overrides) {
     tvr: overrides.tvr || { status: 'Pending', audioName: '', audioUrl: '', answers: {}, remarks: '', completedAt: '' },
     aadhaarVerification: overrides.aadhaarVerification || null,
     panVerification: overrides.panVerification || null,
+    drivingLicenseVerification: overrides.drivingLicenseVerification || null,
+    voterIdVerification: overrides.voterIdVerification || null,
+    vehicleRcVerification: overrides.vehicleRcVerification || null,
+    faceLivenessVerification: overrides.faceLivenessVerification || null,
+    bankAccountVerification: overrides.bankAccountVerification || null,
     documents: Object.fromEntries(documentTypes.map((doc) => [doc, overrides.documents?.[doc] || false])),
     geo: overrides.geo || { status: 'Pending', lat: '', lng: '', photo: false, evidencePhotos: [] },
     credit: overrides.credit || { bureauScore: 0, scorecard: 0, foir: 0, decision: 'Pending', reason: '', referred: false },
@@ -1143,6 +1148,7 @@ function mergeCachedLeadExtras(apps, cachedApps = loadCachedApplications()) {
       voterIdVerification: app.voterIdVerification || cached.voterIdVerification || null,
       vehicleRcVerification: app.vehicleRcVerification || cached.vehicleRcVerification || null,
       faceLivenessVerification: app.faceLivenessVerification || cached.faceLivenessVerification || null,
+      bankAccountVerification: app.bankAccountVerification || cached.bankAccountVerification || null,
       referenceContacts: app.referenceContacts?.length ? app.referenceContacts : cached.referenceContacts || [createReferenceContact()],
       monthlyExpense: app.monthlyExpense || cached.monthlyExpense || 0,
       livingAddress: app.livingAddress || cached.livingAddress || '',
@@ -1959,6 +1965,9 @@ async function loadOperationalData() {
       userAccessPolicies: normalizedPolicies,
       emailPolicies: normalizedPolicies,
     };
+    if (mappedOptions.targets && typeof mappedOptions.targets === 'object' && !Array.isArray(mappedOptions.targets)) {
+      next.targets = mappedOptions.targets;
+    }
   }
 
   if (results.profiles.rows.length) {
@@ -2359,7 +2368,29 @@ function App() {
     roleAccessMatrix: sanitizeRoleAccessMatrix(DEFAULT_ROLE_ACCESS_MATRIX),
   });
   const [selectedId, setSelectedId] = useState('');
+  const [saveStatus, setSaveStatus] = useState({ pending: 0, lastError: '', lastErrorAt: 0 });
   const setNotice = () => {};
+  function reportSaveStart() {
+    setSaveStatus((current) => ({ ...current, pending: current.pending + 1 }));
+  }
+  function reportSaveEnd(error, label) {
+    setSaveStatus((current) => ({
+      pending: Math.max(0, current.pending - 1),
+      lastError: error ? `${label}: ${String(error.message || error)}` : '',
+      lastErrorAt: error ? Date.now() : current.lastErrorAt,
+    }));
+    if (error) console.error(`Unable to save ${label}`, error);
+  }
+  function trackSave(label, task) {
+    reportSaveStart();
+    return Promise.resolve()
+      .then(() => task())
+      .then((value) => { reportSaveEnd(null, label); return value; })
+      .catch((error) => { reportSaveEnd(error, label); throw error; });
+  }
+  function dismissSaveError() {
+    setSaveStatus((current) => ({ ...current, lastError: '' }));
+  }
 
   useEffect(() => {
     function syncPublicRoute() {
@@ -2524,6 +2555,7 @@ function App() {
       }
       if (loaded.dsas?.length) setDsas(loaded.dsas);
       if (loaded.agents?.length) setAgents(loaded.agents);
+      if (loaded.targets && typeof loaded.targets === 'object') setTargets(loaded.targets);
       if (Array.isArray(loaded.applications)) {
         const syncedApplications = mergeCachedLeadExtras(loaded.applications);
         setApplications(syncedApplications);
@@ -2549,10 +2581,8 @@ function App() {
       return withAudit;
     }));
     if (snapshot) {
-      persistApplicationUpdate(snapshot).catch((error) => {
-        console.error('Unable to persist application update', error);
-        setNotice('Update saved locally — Supabase sync failed.');
-      });
+      trackSave(`application ${snapshot.id}`, () => persistApplicationUpdate(snapshot))
+        .catch(() => {});
     }
     setNotice(action);
   }
@@ -2587,7 +2617,7 @@ function App() {
       };
     }));
 
-    await saveLeadFollowup(currentApp, followup);
+    await trackSave('lead followup', () => saveLeadFollowup(currentApp, followup));
     setNotice(followup.closed ? 'Followup closed' : 'Followup updated');
   }
 
@@ -2595,7 +2625,7 @@ function App() {
     const app = applications.find((item) => item.id === appId);
     if (!app || !isDraftApplication(app)) return;
 
-    await deletePersistedLeadDraft(app);
+    await trackSave('draft delete', () => deletePersistedLeadDraft(app));
     setApplications((current) => current.filter((item) => item.id !== appId));
     if (selectedId === appId) {
       const next = applications.find((item) => item.id !== appId);
@@ -2609,7 +2639,7 @@ function App() {
     const app = applications.find((item) => item.id === appId);
     if (!app) return;
 
-    await deletePersistedLeadDraft(app);
+    await trackSave('lead delete', () => deletePersistedLeadDraft(app));
     setApplications((current) => current.filter((item) => item.id !== appId));
     if (selectedId === appId) {
       const next = applications.find((item) => item.id !== appId);
@@ -2618,65 +2648,95 @@ function App() {
     setNotice('Lead deleted');
   }
 
-  function persistMasterChange(action, task) {
-    task()
-      .catch((error) => {
-        console.error(`Unable to save ${action}`, error);
-      });
+  function resolveUpdater(updater, currentValue) {
+    return typeof updater === 'function' ? updater(currentValue) : updater;
   }
 
-  function updateDropdownList(key, values) {
-    setDropdownOptions((current) => ({ ...current, [key]: values }));
-    persistMasterChange('Master dropdown', () => saveMasterDropdownOptions(key, values));
+  function updateDropdownList(key, valuesOrUpdater) {
+    let resolvedValues;
+    setDropdownOptions((current) => {
+      resolvedValues = resolveUpdater(valuesOrUpdater, current[key]);
+      return { ...current, [key]: resolvedValues };
+    });
+    trackSave(`master dropdown:${key}`, () => saveMasterDropdownOptions(key, resolvedValues)).catch(() => {});
   }
 
-  function updateRules(nextRules) {
-    setRules(nextRules);
-    persistMasterChange('Product rules', () => saveProductRules(nextRules));
+  function updateRules(nextRulesOrUpdater) {
+    let resolved;
+    setRules((current) => {
+      resolved = resolveUpdater(nextRulesOrUpdater, current);
+      return resolved;
+    });
+    trackSave('product rules', () => saveProductRules(resolved)).catch(() => {});
   }
 
-  function updateDsas(nextDsas) {
-    setDsas(nextDsas);
-    persistMasterChange('DSA master', () => saveDsaOptions(nextDsas));
+  function updateDsas(nextDsasOrUpdater) {
+    let resolved;
+    setDsas((current) => {
+      resolved = resolveUpdater(nextDsasOrUpdater, current);
+      return resolved;
+    });
+    trackSave('DSA master', () => saveDsaOptions(resolved)).catch(() => {});
   }
 
   function deleteDsa(dsa) {
     const remaining = dsas.filter((item) => item.id !== dsa.id);
+    const remainingAgents = agents.filter((agent) => agent.dsaId !== dsa.id);
     setDsas(remaining);
-    setAgents((current) => current.filter((agent) => agent.dsaId !== dsa.id));
-    persistMasterChange(`DSA "${dsaDisplayName(dsa) || dsa.id}" deleted`, async () => {
+    setAgents(remainingAgents);
+    trackSave(`DSA "${dsaDisplayName(dsa) || dsa.id}" deleted`, async () => {
       await deleteDsaRecord(dsa);
-      await saveAgentOptions(agents.filter((agent) => agent.dsaId !== dsa.id), remaining);
-    });
+      await saveAgentOptions(remainingAgents, remaining);
+    }).catch(() => {});
   }
 
-  function updateAgents(nextAgents) {
-    setAgents(nextAgents);
-    persistMasterChange('Agent master', () => saveAgentOptions(nextAgents, dsas));
+  function updateAgents(nextAgentsOrUpdater) {
+    let resolved;
+    setAgents((current) => {
+      resolved = resolveUpdater(nextAgentsOrUpdater, current);
+      return resolved;
+    });
+    trackSave('agent master', () => saveAgentOptions(resolved, dsas)).catch(() => {});
   }
 
   function updateDsaNetwork(nextDsas, nextAgents = agents) {
     setDsas(nextDsas);
     setAgents(nextAgents);
-    persistMasterChange('DSA and agent master', async () => {
+    trackSave('DSA and agent master', async () => {
       await saveDsaOptions(nextDsas);
       await saveAgentOptions(nextAgents, nextDsas);
-    });
+    }).catch(() => {});
   }
 
-  function updateRoleOptions(nextRoles) {
-    setRoleOptions(nextRoles);
-    persistMasterChange('Role master', () => saveMasterDropdownOptions('roles', nextRoles));
+  function updateRoleOptions(nextRolesOrUpdater) {
+    let resolved;
+    setRoleOptions((current) => {
+      resolved = resolveUpdater(nextRolesOrUpdater, current);
+      return resolved;
+    });
+    trackSave('role master', () => saveMasterDropdownOptions('roles', resolved)).catch(() => {});
+  }
+
+  function updateTargets(nextTargetsOrUpdater) {
+    let resolved;
+    setTargets((current) => {
+      resolved = resolveUpdater(nextTargetsOrUpdater, current);
+      return resolved;
+    });
+    trackSave('targets', () => saveMasterDropdownOptions('targets', resolved || {})).catch(() => {});
   }
 
   function updateEmailPolicies(nextPolicies) {
-    const sanitized = nextPolicies.map(sanitizeUserAccessPolicy).filter(Boolean);
+    const incoming = typeof nextPolicies === 'function'
+      ? nextPolicies(dropdownOptions.emailPolicies || dropdownOptions.userAccessPolicies || [])
+      : nextPolicies;
+    const sanitized = (Array.isArray(incoming) ? incoming : []).map(sanitizeUserAccessPolicy).filter(Boolean);
     setDropdownOptions((current) => ({ ...current, emailPolicies: sanitized, userAccessPolicies: sanitized }));
-    persistMasterChange('User access policy master', async () => {
+    trackSave('user access policies', async () => {
       await saveMasterDropdownOptions('userAccessPolicies', sanitized);
       await saveMasterDropdownOptions('emailPolicies', sanitized);
       await saveProfileAssignmentsForPolicies(sanitized);
-    });
+    }).catch(() => {});
     const activeUserPolicy = findUserAccessPolicy(session?.email, sanitized);
     if (activeUserPolicy?.role) {
       setSession((current) => current ? { ...current, role: activeUserPolicy.role } : current);
@@ -2684,9 +2744,10 @@ function App() {
   }
 
   function updateRoleAccessMatrix(nextMatrix) {
-    const sanitized = sanitizeRoleAccessMatrix(nextMatrix);
+    const incoming = typeof nextMatrix === 'function' ? nextMatrix(dropdownOptions.roleAccessMatrix) : nextMatrix;
+    const sanitized = sanitizeRoleAccessMatrix(incoming);
     setDropdownOptions((current) => ({ ...current, roleAccessMatrix: sanitized }));
-    persistMasterChange('Role access master', () => saveMasterDropdownOptions('roleAccessMatrix', sanitized));
+    trackSave('role access matrix', () => saveMasterDropdownOptions('roleAccessMatrix', sanitized)).catch(() => {});
   }
 
   async function createLead(form) {
@@ -2764,7 +2825,8 @@ function App() {
     }
 
     if (isSupabaseConfigured && supabase) {
-      await persistLeadApplication(app, constrainedForm);
+      await trackSave('lead create', () => persistLeadApplication(app, constrainedForm));
+      await trackSave(`application ${app.id} extras`, () => persistApplicationUpdate(app));
     }
 
     setApplications((current) => [app, ...current.filter((item) => item.id !== id)]);
@@ -2835,6 +2897,14 @@ function App() {
 
   return (
     <div className="app-shell">
+      {mobileNavOpen ? (
+        <button
+          type="button"
+          className="sidebar-backdrop"
+          aria-label="Close menu"
+          onClick={() => setMobileNavOpen(false)}
+        />
+      ) : null}
       <aside className={`sidebar ${mobileNavOpen ? 'open' : ''}`}>
         <div className="sidebar-brand">
           <img className="sidebar-logo" src={dhanurjaLogo} alt="DhanUrja - Driving Every Journey Forward" />
@@ -2908,6 +2978,16 @@ function App() {
             <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search loan ID, mobile, PAN, Aadhaar suffix, DSA" />
           </div>
           <div className="topbar-actions">
+            {saveStatus.pending > 0 && (
+              <span className="save-status save-status-pending" aria-live="polite">
+                Saving… ({saveStatus.pending})
+              </span>
+            )}
+            {saveStatus.lastError && (
+              <button className="save-status save-status-error" onClick={dismissSaveError} title={saveStatus.lastError}>
+                Save failed — retry next change. Dismiss
+              </button>
+            )}
             <button className="ghost-action" onClick={handleLogout}>Logout</button>
           </div>
         </header>
@@ -2929,7 +3009,7 @@ function App() {
           agents={agents}
           setAgents={updateAgents}
           targets={targets}
-          setTargets={setTargets}
+          setTargets={updateTargets}
           setDsaNetwork={updateDsaNetwork}
           rules={rules}
           setRules={updateRules}
@@ -2939,7 +3019,6 @@ function App() {
           setRoleAccessMatrix={updateRoleAccessMatrix}
           setEmailPolicies={updateEmailPolicies}
           dropdownOptions={dropdownOptions}
-          setDropdownOptions={setDropdownOptions}
           updateDropdownList={updateDropdownList}
           session={session}
         />
