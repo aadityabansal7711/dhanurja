@@ -1,0 +1,6 @@
+node_modules
+dist
+.env.local
+qa-screenshots
+untitled folder/API-2.txt
+.DS_Store
